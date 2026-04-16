@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node /Users/ricardoleitaopedro/Desktop/code/pythia/node_modules/typescript/lib/tsc.js --noEmit)"
+    ]
+  }
+}
