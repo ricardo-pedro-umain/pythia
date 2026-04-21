@@ -1,8 +1,9 @@
 import { createTool } from "@mastra/core/tools";
 import { tavily } from "@tavily/core";
 import { z } from "zod";
+import { env } from "@/lib/env";
 
-const tavilyClient = tavily({ apiKey: process.env.TAVILY_API_KEY! });
+const tavilyClient = tavily({ apiKey: env.TAVILY_API_KEY });
 
 export const webSearch = createTool({
   id: "web-search",
@@ -14,7 +15,7 @@ export const webSearch = createTool({
       .number()
       .min(1)
       .max(10)
-      .default(5)
+      .default(8)
       .describe("Maximum number of results to return"),
   }),
   outputSchema: z.object({

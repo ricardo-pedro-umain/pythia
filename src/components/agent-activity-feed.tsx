@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PythiaAnalysisState } from "@/lib/types";
 
 const AGENTS = [
@@ -44,6 +44,8 @@ function StatusIcon({ state }: { state: "done" | "active" | "pending" | "error" 
 }
 
 function formatDuration(ms: number): string {
+  // Sub-second → show as "123ms" so fast steps don't round to a misleading "0s".
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
   const totalSecs = Math.round(ms / 1000);
   const mins = Math.floor(totalSecs / 60);
   const secs = totalSecs % 60;
@@ -52,7 +54,9 @@ function formatDuration(ms: number): string {
 }
 
 function ElapsedTimer({ startTime }: { startTime: number }) {
-  const [now, setNow] = useState(Date.now());
+  // Lazy initializer — `Date.now()` is impure, so passing it directly
+  // would trip react-hooks/purity and re-read the clock on every render.
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 1000);
@@ -96,29 +100,24 @@ function getAgentState(
 export function AgentActivityFeed({
   status,
   retryCount = 0,
+  stepDurations,
 }: {
   status: PythiaAnalysisState["status"];
   retryCount?: number;
+  stepDurations?: PythiaAnalysisState["stepDurations"];
 }) {
-  // Track when each step became active and its final duration
-  const [durations, setDurations] = useState<Record<string, number>>({});
+  // Track when the currently-active step became active, so we can show a
+  // live elapsed timer while it runs. The authoritative finished durations
+  // come from the server via `stepDurations`.
   const activeStartRef = useRef<Record<string, number>>({});
   const prevStatusRef = useRef(status);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const prevStatus = prevStatusRef.current;
     prevStatusRef.current = status;
 
-    // When status changes, the previous active step is now done
     if (prevStatus !== status) {
-      const prevIdx = ORDER.indexOf(prevStatus as AgentKey);
-      if (prevIdx !== -1 && activeStartRef.current[prevStatus]) {
-        const duration = Date.now() - activeStartRef.current[prevStatus];
-        setDurations((d) => ({ ...d, [prevStatus]: duration }));
-        delete activeStartRef.current[prevStatus];
-      }
-
-      // Record start time for the new active step
+      delete activeStartRef.current[prevStatus];
       const currentIdx = ORDER.indexOf(status as AgentKey);
       if (currentIdx !== -1 && !activeStartRef.current[status]) {
         activeStartRef.current[status] = Date.now();
@@ -126,7 +125,7 @@ export function AgentActivityFeed({
     }
   }, [status]);
 
-  // Record start time for the initial active step
+  // Record start time for the initial active step (runs once on mount)
   useEffect(() => {
     const currentIdx = ORDER.indexOf(status as AgentKey);
     if (currentIdx !== -1 && !activeStartRef.current[status]) {
@@ -152,7 +151,7 @@ export function AgentActivityFeed({
       <div className="flex flex-col gap-1.5 stagger-children">
         {AGENTS.map((agent) => {
           const state = getAgentState(agent.key, status, retryCount);
-          const completedDuration = durations[agent.key];
+          const completedDuration = stepDurations?.[agent.key];
           const activeStart = activeStartRef.current[agent.key];
 
           return (

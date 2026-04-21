@@ -239,4 +239,14 @@ export interface PythiaAnalysisState {
   retryCount: number;
   error: string | null;
   createdAt: string;
+  chatMessages: Array<{ role: "user" | "assistant"; content: string }>;
+  /** Duration in ms of each completed pipeline step, keyed by status name. */
+  stepDurations: Partial<Record<
+    | "ingesting"
+    | "cleaning"
+    | "analyzing"
+    | "validating"
+    | "generating_report",
+    number
+  >>;
 }

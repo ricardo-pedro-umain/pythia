@@ -1,16 +1,14 @@
 import { mastra } from "@/mastra";
-import { getAnalysis } from "@/lib/store";
+import { updateAnalysis } from "@/lib/store";
+import { requireAnalysis } from "../_helpers";
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { id } = await params;
-  const analysis = getAnalysis(id);
-
-  if (!analysis) {
-    return Response.json({ error: "Analysis not found" }, { status: 404 });
-  }
+  const got = await requireAnalysis(params);
+  if (got instanceof Response) return got;
+  const { id, analysis } = got;
 
   if (analysis.status !== "complete" || !analysis.report) {
     return Response.json(
@@ -26,6 +24,14 @@ export async function POST(
     return Response.json({ error: "message is required" }, { status: 400 });
   }
 
+  const history = analysis.chatMessages ?? [];
+
+  // Build a single prompt that includes the report context plus the full
+  // conversation history, so the agent can reference earlier turns.
+  const historyText = history
+    .map((m) => `${m.role === "user" ? "User" : "Pythia"}: ${m.content}`)
+    .join("\n\n");
+
   const agent = mastra.getAgent("chatAgent");
   const result = await agent.generate(
     `Here is the full intelligence report and analysis data for context:
@@ -34,8 +40,19 @@ ${analysis.report}
 
 ---
 
-User question: ${message}`
+${historyText ? `Previous conversation:\n\n${historyText}\n\n---\n\n` : ""}User question: ${message}`
   );
 
-  return Response.json({ response: result.text });
+  // Use the updater form so two rapid user messages can't race and drop
+  // one another's turn. The read-append happens inside the SQLite txn.
+  const assistantMsg = { role: "assistant" as const, content: result.text };
+  const userMsg = { role: "user" as const, content: message };
+  const updated = updateAnalysis(id, (prev) => ({
+    chatMessages: [...(prev.chatMessages ?? []), userMsg, assistantMsg],
+  }));
+
+  return Response.json({
+    response: result.text,
+    messages: updated?.chatMessages ?? [],
+  });
 }

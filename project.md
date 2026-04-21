@@ -2,7 +2,9 @@
 
 > "What if a junior analyst team worked overnight on any company you threw at them, and had a briefing ready by morning?"
 
-Pythia is named after the ancient Greek oracle at Delphi — the most powerful source of knowledge in the ancient world. Feed it a company name, and a team of AI agents will investigate, analyze, cross-validate, and deliver a comprehensive intelligence briefing you can interrogate conversationally.
+Pythia is named after the ancient Greek oracle at Delphi. Feed it a company name, and a team of AI agents investigates, cleans, analyzes, cross-validates, and delivers a comprehensive intelligence briefing you can interrogate conversationally.
+
+This document describes the **MVP as implemented**. It is the authoritative description of what the code does today; the aspirational notes that used to live here have been moved into scope discussions.
 
 ---
 
@@ -11,48 +13,55 @@ Pythia is named after the ancient Greek oracle at Delphi — the most powerful s
 1. [Overview](#overview)
 2. [Tech Stack](#tech-stack)
 3. [Architecture](#architecture)
-4. [Agent Definitions](#agent-definitions)
+4. [Agents & Tools](#agents--tools)
 5. [Data Pipeline](#data-pipeline)
 6. [Data Schema](#data-schema)
 7. [Mastra Implementation Details](#mastra-implementation-details)
 8. [Frontend Specification](#frontend-specification)
-9. [Project Structure](#project-structure)
-10. [Key Design Principles](#key-design-principles)
+9. [Testing & Evals](#testing--evals)
+10. [Project Structure](#project-structure)
+11. [Key Design Principles](#key-design-principles)
 
 ---
 
 ## Overview
 
-Pythia is an end-to-end multi-agent application that performs automated company due diligence. A user provides a company name or URL, and a team of specialized AI agents collaborates to produce a structured, confidence-scored intelligence report — plus a conversational chat interface grounded in the collected data.
+Pythia is an end-to-end multi-agent application that performs automated company due diligence. A user types a company name (optionally with a URL). If the name is ambiguous, Pythia shows candidate companies to pick from. A workflow of specialized components — one deterministic ingestion runner and five LLM agents — then produces a confidence-scored Markdown report plus a chat interface grounded in the collected data. All progress streams live to the UI via Server-Sent Events.
 
-### Core Differentiators
+### Core Capabilities
 
-- **Multi-agent orchestration** with supervisor pattern, conditional branching, fan-out/fan-in, and feedback loops
-- **Confidence scoring & evidence chains** — every claim links back to its source and carries a reliability score
-- **Adaptive re-runs** — the supervisor detects data gaps and re-triggers agents with adjusted strategies
-- **Interactive chat layer** — not just a static report, but a conversational interface grounded in collected data
-- **Visible data processing pipeline** — raw scraping → cleaning → structuring → normalization → validation
+- **Multi-agent orchestration** with sequential, parallel, and conditional-retry branches
+- **Confidence scoring & evidence chains** — every claim links back to its source URL and carries a reliability score
+- **Adaptive re-runs** — when the QA agent flags critical gaps, the pipeline re-ingests with targeted queries and re-analyzes (capped at one retry)
+- **Interactive chat** grounded in collected data
+- **Visible orchestration** — each pipeline step is rendered live in the UI with elapsed-time indicators
+- **Company disambiguation** — a lightweight pre-analysis step that catches name collisions (e.g. "Apple" the computer company vs. "Apple" the record label)
+- **Multi-analysis history** — every run is persisted to SQLite and listable in the UI
 
 ---
 
 ## Tech Stack
 
+| Layer | Technology | Notes |
+| --- | --- | --- |
+| **Agent framework** | [Mastra](https://mastra.ai/) `@mastra/core` | TypeScript agents + workflows with structured output |
+| **LLM** | OpenAI GPT-4o via `@ai-sdk/openai` | Primary model for all agents |
+| **Search** | [Tavily](https://tavily.com/) `@tavily/core` | Used by the deterministic ingestion runner and by the disambiguation route |
+| **Backend** | Next.js 16 App Router + API routes | Note: this project uses Next 16's breaking-change API — read `node_modules/next/dist/docs/` before making framework-level changes |
+| **Frontend** | React 19 + Tailwind CSS 4 | Single app, no separate backend deployment |
+| **Storage** | SQLite via `better-sqlite3` with WAL mode | A single `.data/analyses.sqlite` file; atomic read-modify-write via synchronous transactions |
+| **Live updates** | Server-Sent Events | In-process `EventEmitter` pub/sub keyed by analysis id |
+| **PDF export** | `html2canvas-pro` + `jspdf` | Client-side PDF generation from the rendered report |
+| **Runtime schemas** | Zod | Used by Mastra's `structuredOutput` and by a defensive fallback parser |
+| **Tests** | Vitest | 89 unit tests covering pure helpers, SQLite store, schemas, structured-generate fallback, and eval scorers |
+| **Evals** | Custom harness (`tsx` + Vitest-style scorers) | Opt-in; drives the real workflow against a fixture pack and emits a Markdown report |
 
-| Layer               | Technology                                                   | Notes                                                                               |
-| ------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
-| **Agent Framework** | [Mastra](https://mastra.ai/)                                 | TypeScript-first AI agent framework. Used for agents, tools, workflows, and memory. |
-| **LLM**             | OpenAI GPT-4o (via Mastra's OpenAI integration)              | Primary model for all agents                                                        |
-| **Backend**         | Next.js API routes (App Router)                              | Mastra integrates natively with Next.js                                             |
-| **Frontend**        | Next.js (App Router) + React + Tailwind CSS                  | Single app, no separate backend deployment                                          |
-| **Search/Scraping** | Tavily API (web search) | Ingestion agent tools                                                               |
-| **Data Storage**    | In-memory / JSON state (MVP)                                 | Workflow state managed by Mastra. No database required for MVP.                     |
-| **Deployment**      | Vercel                                                       | Single deployment for both frontend and API                                         |
-
-
-### Required API Keys
+### Required API keys
 
 - `OPENAI_API_KEY` — for GPT-4o
-- `TAVILY_API_KEY` — for web search tool
+- `TAVILY_API_KEY` — for web search
+
+Both are validated lazily via a Proxy in `src/lib/env.ts`. Missing keys throw a descriptive error at first use rather than at build time, so `next build` still runs on a machine without secrets.
 
 ---
 
@@ -63,688 +72,211 @@ Pythia is an end-to-end multi-agent application that performs automated company 
 │           User Interface             │
 │         (Next.js App Router)         │
 └──────────────────┬───────────────────┘
-                   │ API Routes
+                   │ fetch + SSE
                    ▼
-┌──────────────────────────────────────┐    ┌──────────────────────────┐
-│        Supervisor Agent              │◀╌╌╌│     Mastra Workflow      │
-│         (Orchestrator)               │    │  (branching/conditions)  │
-└──────┬───────────────┬────────────┬──┘    └──────────────────────────┘
-       │               │            │
-       ▼               ▼            ▼
-┌───────────┐  ┌────────────┐  ┌──────────────────┐
-│ Ingestion │  │ Financial  │  │ Brand & Market   │
-│   Agent   │  │  Analyst   │  │     Agent        │
-└─────┬─────┘  └──────┬─────┘  └────────┬─────────┘
-      └────────────────┼─────────────────┘
-                       │
-             ┌─────────▼──────────┐
-             │   Data Engineer    │
-             │       Agent        │
-             └─────────┬──────────┘
-                       │
-             ┌─────────▼──────────┐
-             │     QA Agent       │── Gaps detected ──▶ (Supervisor)
-             │    (Validator)     │
-             └─────────┬──────────┘
-                       │
-             ┌─────────▼──────────┐
-             │    Report Agent    │
-             └─────────┬──────────┘
-                       │
-             ┌─────────▼──────────┐
-             │    Chat Agent      │
-             │      (Q&A)         │
-             └────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                Next.js API routes                   │
+│  /api/disambiguate — pick the right company         │
+│  /api/analyze      — create row + kick off workflow │
+│  /api/analysis/:id/{status,stream,chat}             │
+│  /api/analyses     — list history                   │
+└──────────────────┬──────────────────────────────────┘
+                   │
+┌──────────────────▼───────────────────┐   ┌──────────────────────┐
+│        Mastra Workflow               │◀──│  SQLite store        │
+│        pythiaWorkflow                │──▶│  (persistence)       │
+└───┬───────────────┬───────────────┬──┘   └──────────┬───────────┘
+    │               │               │                 │
+    ▼               ▼               ▼                 ▼
+┌───────────┐ ┌────────────┐ ┌──────────────────┐  EventEmitter
+│ Ingestion │ │  Data      │ │ Financial +      │  pub/sub
+│ runner    │ │  Engineer  │ │ Brand (parallel) │  (→ SSE clients)
+│ (code,    │ │  (LLM)     │ │   (LLM × 2)      │
+│ not LLM)  │ └──────┬─────┘ └────────┬─────────┘
+└─────┬─────┘        │                │
+      └──────────────┼────────────────┘
+                     ▼
+            ┌──────────────────┐
+            │  QA Validator    │── requiresRerun ─┐
+            │      (LLM)       │                  │
+            └────────┬─────────┘                  │
+                     │ no retry                   │
+                     ▼                            ▼
+            ┌──────────────────┐   ┌──────────────────────────┐
+            │  Report Agent    │   │  Conditional Retry       │
+            │     (LLM)        │   │  (re-ingest + re-analyze │
+            └────────┬─────────┘   │   with gap queries,      │
+                     │             │   max 1 iteration)       │
+                     ▼             └──────────┬───────────────┘
+             Markdown report                  │
+                     │                        │
+                     └── merges back ─────────┘
+
+Chat agent (LLM, separate route): answers follow-up questions
+grounded in the analysis state for any completed run.
 ```
 
+### Orchestration flow
 
+1. User submits a company name (+ optional URL). The `/api/disambiguate` route runs a quick Tavily search and, if the name is ambiguous, returns 2-4 candidates for the user to choose between. Clear cases (e.g. "Tesla" → tesla.com dominates) skip straight through.
+2. `/api/analyze` creates a row in SQLite and calls `pythiaWorkflow.createRun().start(...)` without awaiting — the POST returns the analysis id immediately. The workflow runs in the background.
+3. The **ingestion runner** (pure code) fires the canonical 8-query search panel at Tavily in parallel, deduplicates by URL, and persists a `RawIngestionResult`.
+4. The **data engineer** agent turns raw sources into a structured `CompanyProfile`, using Mastra's `structuredOutput` to get a zod-validated object directly.
+5. The **financial analyst** and **brand & market** agents run in parallel (`.parallel([...])`) on the same profile.
+6. The **QA validator** cross-checks all three analyses. If it sets `requiresRerun: true` with instructions, the **conditional retry** step re-ingests with gap-filling queries and re-runs clean → analyze → validate once more. Otherwise the retry step is a passthrough.
+7. The **report agent** synthesizes the Markdown briefing.
+8. The **chat agent** (separate HTTP route, not part of the workflow) answers follow-up questions at any point after ingestion, grounded in the persisted analysis state.
 
-### Orchestration Flow
+### Handoff patterns
 
-1. User submits company name/URL
-2. **Supervisor** triggers the **Ingestion Agent** to collect raw data
-3. **Data Engineer Agent** cleans and structures the raw data into a `CompanyProfile`
-4. **Supervisor** fans out to **Financial Analyst** and **Brand & Market Agent** in parallel
-5. Both analysis agents return their findings
-6. **QA Agent** validates all findings — scores confidence, links evidence, detects gaps
-7. **If gaps are critical**: QA Agent signals the Supervisor to re-run specific agents with adjusted search strategies (max 1 retry loop)
-8. **Report Agent** synthesizes everything into a structured report
-9. **Chat Agent** becomes available, grounded in all collected data
-10. User can interrogate findings conversationally
-
-### Handoff Patterns Demonstrated
-
-
-| Pattern                | Where                                                            |
-| ---------------------- | ---------------------------------------------------------------- |
-| **Sequential**         | Ingestion → Data Engineer → Analysis → QA → Report               |
-| **Fan-out / Fan-in**   | Financial Analyst + Brand Agent run in parallel, results merged  |
-| **Feedback loop**      | QA Agent → Supervisor → targeted re-run → QA Agent               |
-| **Supervisor routing** | Orchestrator decides which agents to (re-)trigger based on state |
-| **Grounded handoff**   | All collected data handed to Chat Agent as context               |
-
+| Pattern | Where |
+| --- | --- |
+| **Deterministic stage** | Ingestion (pure Tavily code, no LLM) |
+| **Sequential** | Ingestion → clean-data → (parallel analysis) → QA → retry? → report |
+| **Fan-out / fan-in** | `.parallel([financialAnalysisStep, brandAnalysisStep])` |
+| **Conditional feedback loop** | QA's `requiresRerun` flag → `conditionalRetryStep` → re-ingest + re-analyze, max 1 iteration |
+| **Persistence bus** | Every step calls `updateAnalysis(id, …)`, which commits to SQLite and emits on the in-process EventEmitter |
+| **Live fan-out** | SSE handlers subscribe to `analysis:<id>` events, forward to connected browser tabs |
+| **Grounded handoff** | Chat agent reads the persisted `PythiaAnalysisState` as its context |
 
 ---
 
-## Agent Definitions
+## Agents & Tools
 
-### 🧠 Supervisor Agent (Orchestrator)
+### 🧹 Ingestion (deterministic runner — NOT an agent)
 
-- **Role**: Manages the overall workflow state machine. Routes tasks to agents, decides when to re-run, aggregates results.
-- **Implementation**: This is NOT a standalone Mastra `Agent` — it is the **Mastra `Workflow`** itself, with conditional step logic.
-- **Key decisions**:
-  - After QA validation: are there critical gaps? If yes, re-trigger Ingestion with refined queries (max 1 retry).
-  - After parallel analysis: are both results present? If one failed, proceed with partial data and flag it.
-
-### 📥 Ingestion Agent
-
-- **Name**: `ingestion-agent`
-- **System Prompt**:
-You are a senior research analyst at a deal intelligence firm. Your job is to gather comprehensive raw data about a company from multiple sources.
-
-Given a company name (and optionally a URL), use your tools to:
-
-1. Search the web for the company's official website, recent news, press releases, and funding announcements.
-2. Scrape the company's website for key information (about page, team, product descriptions).
-3. Search for financial data, funding rounds, revenue estimates.
-4. Search for competitor mentions and market positioning.
-5. Search for employee reviews, social media presence, and sentiment signals.
-
-Cast a wide net. Collect MORE data than needed - the Data Engineer will clean it. For each piece of information, always note the source URL and the date it was published/accessed.
-
-Return your findings as a structured JSON object with the following shape:
-
-```ts
-{
-  companyName: string;
-  inputUrl: string | null;
-  officialWebsite: string | null;
-  rawSources: Array<{
-    url: string;
-    title: string;
-    content: string;
-    sourceType: "website" | "news" | "social" | "financial" | "review";
-    dateAccessed: string; // ISO format
-    datePublished: string | null;
-  }>;
-}
-```
-
-Aim for at least 8-15 diverse sources. Prioritize recency and reliability.
-
-- **Tools**:
-- `webSearch` — Tavily API search. Input: query string. Output: array of search results with URLs, titles, snippets.
-- **Output**: `RawIngestionResult` (see Data Schema)
+- **File**: `src/mastra/tools/ingestion-runner.ts`
+- **Why not an LLM?** The original plan had an ingestion *agent* with a `webSearch` tool. In practice, giving the LLM latitude over what to search produced unstable panel coverage and burned tokens on orchestration it didn't need. The canonical 8-query panel is now hard-coded and fires in parallel; the saved tokens and latency go toward the downstream reasoning steps.
+- **Canonical search panel** (each query tagged with a `sourceType`):
+  - `{c} official website about` → `website`
+  - `{c} funding raised valuation investors` → `financial`
+  - `{c} revenue ARR employees headcount {y}` → `financial`
+  - `{c} CEO founder leadership team` → `website`
+  - `{c} product launch news {y}` → `news`
+  - `{c} competitors market share industry` → `news`
+  - `{c} reviews employees culture glassdoor` → `review`
+  - `{c} crunchbase pitchbook acquisition` → `financial`
+- `{y}` is the current calendar year — hardcoded years silently biased results toward stale reporting once the calendar flipped.
+- `extraQueries` parameter lets the retry branch inject gap-filling searches derived from the QA's `rerunInstructions`.
+- Failures are swallowed individually (`Promise.allSettled`) unless *every* query fails, in which case the caller gets a descriptive error.
+- Results are dedup'd by URL (highest-score wins), ranked, and capped at 30.
 
 ### 🧹 Data Engineer Agent
 
-- **Name**: `data-engineer-agent`
-- **System Prompt**:
-You are a meticulous data engineer specializing in company intelligence. You receive raw, messy data collected from multiple web sources about a company.
-
-Your job is to:
-
-1. Extract structured facts from the raw text (company name, founding year, headcount, funding, tech stack, etc.).
-2. Deduplicate information that appears across multiple sources.
-3. Normalize data formats (dates to ISO, currencies to USD, etc.).
-4. Assess the freshness of each data point (is it from this year? Last year? Older?).
-5. Tag each extracted fact with its source(s) for provenance tracking.
-6. Identify and flag contradictions between sources.
-7. Determine an overall data quality score.
-
-Return a structured CompanyProfile JSON object (schema provided below). For EVERY field, include:
-
-- The extracted value (or null if not found)
-- A confidence score (0.0 to 1.0)
-- Source URL(s) that support this value
-- If sources contradict each other, pick the most reliable/recent one and note the contradiction.
-
-CompanyProfile schema:
-
-```ts
-{
-  name: string;
-  domain: string | null;
-  description: string;
-  industry: string | null;
-
-  founded: {
-    value: number | null;
-    confidence: number;
-    sources: string[];
-  };
-
-  headquarters: {
-    value: string | null;
-    confidence: number;
-    sources: string[];
-  };
-
-  headcount: {
-    value: number | null;
-    range: string | null;
-    confidence: number;
-    sources: string[];
-  };
-
-  funding: {
-    totalRaised: {
-      value: number | null;
-      currency: "USD";
-      confidence: number;
-      sources: string[];
-    };
-    lastRound:
-      | {
-          type: string;
-          amount: number | null;
-          date: string | null;
-          investors: string[];
-          confidence: number;
-          sources: string[];
-        }
-      | null;
-    fundingHistory: Array<{
-      type: string;
-      amount: number | null;
-      date: string | null;
-      confidence: number;
-    }>;
-  };
-
-  revenue: {
-    estimated: number | null;
-    range: string | null;
-    confidence: number;
-    sources: string[];
-  };
-
-  businessModel: {
-    value: string | null;
-    confidence: number;
-    sources: string[];
-  };
-
-  products: Array<{
-    name: string;
-    description: string;
-    confidence: number;
-  }>;
-
-  competitors: Array<{
-    name: string;
-    overlap: string;
-    confidence: number;
-    sources: string[];
-  }>;
-
-  techStack: Array<{
-    technology: string;
-    confidence: number;
-    source: string;
-  }>;
-
-  keyPeople: Array<{
-    name: string;
-    role: string;
-    confidence: number;
-    source: string;
-  }>;
-
-  recentNews: Array<{
-    title: string;
-    summary: string;
-    date: string;
-    url: string;
-    sentiment: "positive" | "neutral" | "negative";
-  }>;
-
-  socialPresence: {
-    linkedin: string | null;
-    twitter: string | null;
-    otherProfiles: Array<{
-      platform: string;
-      url: string;
-    }>;
-  };
-
-  metadata: {
-    dataQualityScore: number;
-    sourcesUsed: number;
-    dataFreshness: "recent" | "mixed" | "stale";
-    contradictions: Array<{
-      field: string;
-      description: string;
-    }>;
-    gaps: Array<{
-      field: string;
-      severity: "critical" | "minor";
-    }>;
-  };
-}
-```
-
-- **Tools**: None (pure LLM reasoning over provided data)
-- **Input**: `RawIngestionResult`
-- **Output**: `CompanyProfile`
+- **File**: `src/mastra/agents/data-engineer.ts`
+- **Job**: Turn raw Tavily hits into a structured `CompanyProfile` with confidence scores, source URLs, and gap/contradiction metadata.
+- **Structured output**: `companyProfileSchema` in `src/mastra/schemas.ts`, validated by the `generateStructured` helper.
+- **Tools**: None.
 
 ### 📊 Financial Analyst Agent
 
-- **Name**: `financial-analyst-agent`
-- **System Prompt**:
-You are a financial analyst specializing in company valuation and financial health assessment. You receive a structured CompanyProfile and must produce a financial analysis.
-
-Your analysis should cover:
-
-1. **Funding Assessment**: Evaluate the funding trajectory. Is the company well-funded? Burn rate implications?
-2. **Revenue Analysis**: Based on available signals (headcount, funding, market), estimate revenue range and growth trajectory.
-3. **Market Size**: Estimate the TAM/SAM/SOM for the company's primary market.
-4. **Unit Economics Signals**: Any indicators of profitability, margins, or business model sustainability?
-5. **Financial Risks**: Identify key financial risks (runway, competition, market timing).
-6. **Comparable Companies**: Identify 2-3 comparable public/private companies and their valuations for context.
-
-Return your analysis as:
-
-```ts
-{
-  fundingAssessment: {
-    summary: string;
-    score: "strong" | "adequate" | "concerning" | "unknown";
-    details: string;
-  };
-
-  revenueAnalysis: {
-    estimatedARR: {
-      low: number | null;
-      high: number | null;
-    };
-    growthTrajectory: string;
-    confidence: number;
-  };
-
-  marketSize: {
-    tam: string | null;
-    sam: string | null;
-    som: string | null;
-    confidence: number;
-  };
-
-  unitEconomics: {
-    summary: string;
-    signals: string[];
-    confidence: number;
-  };
-
-  financialRisks: Array<{
-    risk: string;
-    severity: "high" | "medium" | "low";
-    explanation: string;
-  }>;
-
-  comparables: Array<{
-    company: string;
-    relevance: string;
-    valuation: string | null;
-  }>;
-
-  overallFinancialHealth: {
-    score: "strong" | "moderate" | "weak" | "insufficient_data";
-    summary: string;
-  };
-
-  confidence: number;
-  evidenceSources: string[];
-}
-```
-
-Be honest about uncertainty. If data is insufficient, say so clearly rather than fabricating estimates.
-
-- **Tools**: `webSearch` (for additional targeted financial searches if needed)
-- **Input**: `CompanyProfile`
-- **Output**: `FinancialAnalysis`
+- **File**: `src/mastra/agents/financial-analyst.ts`
+- **Job**: Produce a `FinancialAnalysis` from the `CompanyProfile` — funding assessment, revenue bands, market size, unit economics, risks, comparables.
+- **Structured output**: `financialAnalysisSchema`.
+- **Tools**: `webSearch` (Tavily) for targeted financial follow-ups.
 
 ### 🏷️ Brand & Market Agent
 
-- **Name**: `brand-market-agent`
-- **System Prompt**:
-You are a brand strategist and market analyst. You receive a structured CompanyProfile and must produce a brand and market positioning analysis.
+- **File**: `src/mastra/agents/brand-market.ts`
+- **Job**: Produce a `BrandMarketAnalysis` from the same profile — positioning, competitive analysis, sentiment, growth signals, brand risks.
+- **Structured output**: `brandMarketAnalysisSchema`.
+- **Tools**: `webSearch` for targeted brand/market follow-ups.
 
-Your analysis should cover:
+### 🧪 QA Validator Agent
 
-1. **Brand Positioning**: How does the company position itself? What's their value proposition?
-2. **Market Positioning**: Where do they sit in the competitive landscape? Leader, challenger, niche?
-3. **Competitive Analysis**: Detailed comparison with top 3-5 competitors. Strengths and weaknesses.
-4. **Sentiment Analysis**: What's the overall market/public sentiment? Based on news, reviews, social signals.
-5. **Brand Risks**: Reputation risks, PR issues, negative signals.
-6. **Growth Signals**: Hiring patterns, product launches, market expansion indicators.
-
-Return your analysis as:
-
-```ts
-{
-  brandPositioning: {
-    valueProposition: string;
-    targetAudience: string;
-    toneAndPersonality: string;
-    confidence: number;
-  };
-
-  marketPositioning: {
-    category: string;
-    position: "leader" | "challenger" | "niche" | "emerging";
-    marketShare: string | null;
-    confidence: number;
-  };
-
-  competitiveAnalysis: {
-    summary: string;
-    competitors: Array<{
-      name: string;
-      strengths: string[];
-      weaknesses: string[];
-      differentiator: string;
-    }>;
-  };
-
-  sentiment: {
-    overall: "positive" | "neutral" | "negative" | "mixed";
-    signals: Array<{
-      text: string;
-      source: string;
-      sentiment: "positive" | "neutral" | "negative";
-    }>;
-    confidence: number;
-  };
-
-  brandRisks: Array<{
-    risk: string;
-    severity: "high" | "medium" | "low";
-    explanation: string;
-  }>;
-
-  growthSignals: Array<{
-    signal: string;
-    type: "hiring" | "product" | "expansion" | "partnership" | "other";
-    source: string;
-  }>;
-
-  overallBrandHealth: {
-    score: "strong" | "moderate" | "weak" | "insufficient_data";
-    summary: string;
-  };
-
-  confidence: number;
-  evidenceSources: string[];
-}
-```
-
-- **Tools**: `webSearch` (for additional targeted brand/market searches)
-- **Input**: `CompanyProfile`
-- **Output**: `BrandMarketAnalysis`
-
-### 🧪 QA Agent (Validator)
-
-- **Name**: `qa-validator-agent`
-- **System Prompt**:
-You are a senior quality assurance analyst and fact-checker at a deal intelligence firm. You receive:
-- The original CompanyProfile (structured data)
-- The Financial Analysis
-- The Brand & Market Analysis
-
-Your job is to:
-
-1. **Cross-validate**: Do the financial and brand analyses align with the underlying data? Flag contradictions.
-2. **Confidence audit**: Review confidence scores. Are they justified? Adjust if needed.
-3. **Evidence check**: Does every major claim have a source? Flag unsupported claims.
-4. **Gap analysis**: What critical information is missing? What would significantly improve the analysis?
-5. **Contradiction detection**: Do the financial and brand analyses contradict each other?
-6. **Overall quality score**: Rate the overall reliability of the intelligence package.
-
-Return your validation as:
-
-```ts
-{
-  overallQualityScore: number; // 0.0 to 1.0
-  qualityLevel: "high" | "medium" | "low";
-
-  crossValidation: {
-    alignmentScore: number;
-    contradictions: Array<{
-      between: string;
-      description: string;
-      severity: "high" | "medium" | "low";
-    }>;
-  };
-
-  confidenceAdjustments: Array<{
-    section: string;
-    originalConfidence: number;
-    adjustedConfidence: number;
-    reason: string;
-  }>;
-
-  unsupportedClaims: Array<{
-    claim: string;
-    section: string;
-    recommendation: string;
-  }>;
-
-  criticalGaps: Array<{
-    field: string;
-    importance: "critical" | "important" | "nice_to_have";
-    searchSuggestion: string;
-  }>;
-
-  recommendations: Array<{
-    action: string;
-    priority: "high" | "medium" | "low";
-  }>;
-
-  requiresRerun: boolean;
-  rerunInstructions: string | null;
-}
-```
-
-Set requiresRerun to true ONLY if there are critical gaps that would make the report misleading. Include specific rerunInstructions for what the Ingestion Agent should search for.
-
-- **Tools**: None (pure reasoning and validation)
-- **Input**: `CompanyProfile` + `FinancialAnalysis` + `BrandMarketAnalysis`
-- **Output**: `QAValidation`
+- **File**: `src/mastra/agents/qa-validator.ts`
+- **Job**: Cross-validate profile + financial + brand; flag contradictions, adjust confidences, identify critical gaps, and decide whether to trigger a retry.
+- **Structured output**: `qaValidationSchema`.
+- **Retry contract**: Sets `requiresRerun: true` plus a `rerunInstructions` string when gaps are critical. The conditional retry step splits that string into extra ingestion queries and runs ingestion → clean → analyze → validate once more, with a `(this is a RETRY — be lenient on gaps that were already flagged)` preamble to prevent infinite loops.
 
 ### 📝 Report Agent
 
-- **Name**: `report-agent`
-- **System Prompt**:
-You are a senior analyst who writes executive intelligence briefings. You receive all analysis outputs and the QA validation, and must produce a polished, structured report.
-
-The report should be in Markdown format with the following structure:
-
-> # Company Intelligence Report: [Company Name]
->
-> *Generated by Pythia on [date] | Overall Confidence: [score from QA]*
->
-> ## Executive Summary
->
-> 3-4 sentence overview of the company and key findings.
->
-> ## Company Overview
->
-> Basic facts: what they do, when founded, where based, how big, key people.
->
-> ## Financial Analysis
->
-> Funding, revenue estimates, market size, financial health.
-> Each major claim should have an inline confidence indicator:
->
-> - 🟢 High
-> - 🟡 Medium
-> - 🔴 Low
->
-> ## Market & Brand Position
->
-> Positioning, competitive landscape, sentiment, growth signals.
->
-> ## Risk Assessment
->
-> Combined financial and brand risks, ranked by severity.
->
-> ## Key Findings & Recommendations
->
-> Top 5 most important takeaways.
->
-> ## Data Quality Notes
->
-> Transparency section: what data was available, what was missing, overall reliability.
->
-> ## Sources
->
-> Numbered list of all sources used.
-
-Guidelines:
-
-- Be concise but thorough.
-- Use confidence indicators (🟢🟡🔴) inline with claims.
-- Never present uncertain information as fact.
-- Include source references as [1], [2], etc.
-- The tone should be professional, analytical, and balanced.
-- **Tools**: None
-- **Input**: `CompanyProfile` + `FinancialAnalysis` + `BrandMarketAnalysis` + `QAValidation`
-- **Output**: Markdown string (the report)
+- **File**: `src/mastra/agents/report.ts`
+- **Job**: Produce the final Markdown briefing from the four prior outputs. Includes confidence indicators (🟢 🟡 🔴) inline with claims.
+- **Tools**: None.
 
 ### 💬 Chat Agent
 
-- **Name**: `chat-agent`
-- **System Prompt**:
-You are Pythia, an AI deal intelligence analyst. You have just completed a comprehensive analysis of a company, and the user wants to ask follow-up questions.
+- **File**: `src/mastra/agents/chat.ts`
+- **Job**: Answer follow-up questions, grounded exclusively in the persisted analysis state.
+- **Wiring**: Served by `/api/analysis/[id]/chat`. Each turn appends user + assistant messages to the analysis row atomically via the updater-function overload of `updateAnalysis`.
+- **Tools**: None.
 
-You have access to the full analysis data (provided in your context). When answering:
+### 🔧 Web Search Tool
 
-1. ONLY use information from the collected data and analysis. Do not make up facts.
-2. Always reference which part of the analysis your answer comes from.
-3. If the user asks something not covered by the data, say so honestly and suggest what additional research could help.
-4. Be conversational but professional.
-5. If asked for opinions, frame them as "based on the available data" rather than absolute statements.
+- **File**: `src/mastra/tools/web-search.ts`
+- Used by financial and brand agents (the ingestion runner uses the Tavily SDK directly).
 
-The user may ask things like:
+### 🔎 Disambiguation (HTTP route, not part of the workflow)
 
-- "What's their biggest risk?"
-- "How do they compare to [competitor]?"
-- "Is this a good investment?"
-- "What data are you least confident about?"
-- "Tell me more about their funding history"
-- **Tools**: None (grounded in context from previous agents)
-- **Input**: Full context from all previous agents (injected into system prompt or message history)
-- **Output**: Conversational responses
+- **File**: `src/lib/disambiguate.ts` + `src/app/api/disambiguate/route.ts`
+- Runs two parallel Tavily queries for the typed name, filters out reference sites (wikipedia, crunchbase, bloomberg, …), dedupes by root domain, and applies two confidence gates:
+  1. If the top result dominates (`topScore ≥ 0.6` AND `topScore ≥ 1.6 × secondScore`) → no disambiguation.
+  2. If all surviving candidates resolve to the same company (e.g. "xAI" / "xAI Corp") → no disambiguation.
+- Otherwise returns up to 4 candidates for the UI to display. Pure heuristics, fully unit-tested (see `src/lib/disambiguate.test.ts`).
 
 ---
 
 ## Data Pipeline
 
 ```
-  Company Name / URL
-         │
-         ▼
-  ┌─────────────────────────────────┐   ┌─────────────────────────┐
-  │  Stage 1: Raw Collection        │◀──│   requiresRerun = true  │
-  │  Ingestion Agent                │   └─────────────────────────┘
-  └────────────────┬────────────────┘              ▲
-                   │                               │
-                   ▼                               │
-       RawIngestionResult (8–15 sources)           │
-                   │                               │
-                   ▼                               │
-  ┌─────────────────────────────────┐              │
-  │  Stage 2: Cleaning & Structuring│              │
-  │  Data Engineer Agent            │              │
-  └────────────────┬────────────────┘              │
-                   │                               │
-                   ▼                               │
-       CompanyProfile with provenance metadata     │
-                   │                               │
-                   ▼                               │
-  ┌─────────────────────────────────┐              │
-  │  Stage 3: Parallel Analysis     │              │
-  └───────┬─────────────────┬───────┘              │
-          │                 │                      │
-          ▼                 ▼                      │
-  ┌───────────────┐  ┌──────────────────┐          │
-  │   Financial   │  │ Brand & Market   │          │
-  │   Analysis    │  │    Analysis      │          │
-  └───────┬───────┘  └──────┬───────────┘          │
-          └─────────────────┘                      │
-                   │                               │
-                   ▼                               │
-          Combined Analysis                        │
-                   │                               │
-                   ▼                               │
-  ┌─────────────────────────────────┐              │
-  │  Stage 4: Validation & QA       │──────────────┘
-  │  QA Agent                       │
-  └────────────────┬────────────────┘
-                   │ requiresRerun = false
-                   ▼
-          ┌─────────────────┐
-          │    Report        │
-          │   Generation     │
-          └─────────────────┘
+    Company Name / URL
+           │
+           ▼
+┌──────────────────────────────┐
+│  Pre-flight: Disambiguation  │    (no LLM — pure Tavily + heuristics)
+│    /api/disambiguate         │
+└──────────────┬───────────────┘
+               │ user picks or passes through
+               ▼
+┌──────────────────────────────┐
+│  Stage 1: Ingestion Runner   │◀─── extraQueries from QA retry
+│  (pure code, 8 Tavily calls) │
+└──────────────┬───────────────┘
+               ▼
+     RawIngestionResult  (≤ 30 dedup'd sources)
+               │
+               ▼
+┌──────────────────────────────┐
+│  Stage 2: Data Engineer LLM  │
+│  → zod-validated profile     │
+└──────────────┬───────────────┘
+               ▼
+        CompanyProfile (with confidence/source per field)
+               │
+               ▼
+┌──────────────────────────────┐
+│  Stage 3: Parallel Analysis  │
+│  Financial  +  Brand/Market  │   .parallel([…])
+└──────┬───────────────┬───────┘
+       │               │
+       └───────┬───────┘
+               ▼
+┌──────────────────────────────┐
+│  Stage 4: QA Validation      │── requiresRerun = true ─┐
+└──────────────┬───────────────┘                         │
+               │ no                                      │
+               ▼                                         ▼
+┌──────────────────────────────┐   ┌────────────────────────────────┐
+│  Stage 5: Report generation  │   │  Conditional retry             │
+│  → Markdown                  │   │  re-ingest with extra queries, │
+└──────────────┬───────────────┘   │  re-run clean/analyze/QA once  │
+               ▼                   └──────────────┬─────────────────┘
+          Persisted + streamed                    │
+          to the UI                               │
+                                   ◀──────────────┘
 ```
 
-
-
-### Stage 1: Raw Collection (Ingestion Agent)
-
-1. Input company name / URL.
-2. Run web searches (Tavily), for example:
-  - `[company] funding rounds`
-  - `[company] revenue employees`
-  - `[company] competitors`
-  - `[company] news 2024`
-  - `[company] reviews glassdoor`
-3. In parallel:
-  - Scrape selected URLs and collect structured search snippets (Tavily).
-4. Merge outputs into `RawIngestionResult` (8-15 diverse sources).
-
-### Stage 2: Cleaning & Structuring (Data Engineer Agent)
-
-1. Take `RawIngestionResult` as input.
-2. Perform LLM-powered extraction and normalization:
-  - Entity extraction (names, dates, amounts, roles)
-  - Deduplication across sources
-  - Format normalization (dates -> ISO, currency -> USD)
-  - Temporal tagging (data freshness)
-  - Source reliability scoring
-  - Contradiction detection
-  - Gap identification
-3. Output `CompanyProfile` (JSON) with provenance metadata.
-
-### Stage 3: Parallel Analysis (Financial + Brand Agents)
-
-1. Use `CompanyProfile` as shared input.
-2. Run in parallel:
-  - Financial Analysis
-  - Brand and Market Analysis
-3. Merge both into `Combined Analysis`.
-
-### Stage 4: Validation & Quality Assurance (QA Agent)
-
-1. Validate `Combined Analysis` with QA checks:
-  - Cross-validation
-  - Confidence auditing
-  - Evidence checking
-  - Gap analysis
-  - Contradiction detection
-2. Branch on result:
-  - If `requiresRerun = true`, route back to Supervisor (max 1 retry).
-  - If `requiresRerun = false`, continue to report generation.
+Every stage calls `updateAnalysis(id, patch)`, which commits to SQLite *inside* a transaction and emits on the EventEmitter. SSE clients subscribed to `analysis:<id>` see each transition live. Step durations (`stepDurations`) are recorded via the updater-function overload so parallel steps can't clobber each other's entries.
 
 ---
 
 ## Data Schema
 
-All TypeScript types used across the system:
+All TypeScript types live in `src/lib/types.ts`; the matching Zod schemas live in `src/mastra/schemas.ts`.
 
-```typescript
-// === Ingestion Agent Output ===
+```ts
+// === Raw ingestion ===
 interface RawSource {
   url: string;
   title: string;
@@ -761,10 +293,10 @@ interface RawIngestionResult {
   rawSources: RawSource[];
 }
 
-// === Data Engineer Agent Output ===
+// === Shared fragments ===
 interface ConfidenceValue<T> {
   value: T;
-  confidence: number; // 0.0 - 1.0
+  confidence: number; // 0..1
   sources: string[];
 }
 
@@ -777,6 +309,7 @@ interface FundingRound {
   sources: string[];
 }
 
+// === Company profile (data engineer output) ===
 interface CompanyProfile {
   name: string;
   domain: string | null;
@@ -793,28 +326,11 @@ interface CompanyProfile {
   revenue: ConfidenceValue<number | null> & { range: string | null };
   businessModel: ConfidenceValue<string | null>;
   products: Array<{ name: string; description: string; confidence: number }>;
-  competitors: Array<{
-    name: string;
-    overlap: string;
-    confidence: number;
-    sources: string[];
-  }>;
-  techStack: Array<{
-    technology: string;
-    confidence: number;
-    source: string;
-  }>;
-  keyPeople: Array<{
-    name: string;
-    role: string;
-    confidence: number;
-    source: string;
-  }>;
+  competitors: Array<{ name: string; overlap: string; confidence: number; sources: string[] }>;
+  techStack: Array<{ technology: string; confidence: number; source: string }>;
+  keyPeople: Array<{ name: string; role: string; confidence: number; source: string }>;
   recentNews: Array<{
-    title: string;
-    summary: string;
-    date: string;
-    url: string;
+    title: string; summary: string; date: string; url: string;
     sentiment: "positive" | "neutral" | "negative";
   }>;
   socialPresence: {
@@ -831,134 +347,11 @@ interface CompanyProfile {
   };
 }
 
-// === Financial Analyst Agent Output ===
-interface FinancialAnalysis {
-  fundingAssessment: {
-    summary: string;
-    score: "strong" | "adequate" | "concerning" | "unknown";
-    details: string;
-  };
-  revenueAnalysis: {
-    estimatedARR: { low: number | null; high: number | null };
-    growthTrajectory: string;
-    confidence: number;
-  };
-  marketSize: {
-    tam: string | null;
-    sam: string | null;
-    som: string | null;
-    confidence: number;
-  };
-  unitEconomics: {
-    summary: string;
-    signals: string[];
-    confidence: number;
-  };
-  financialRisks: Array<{
-    risk: string;
-    severity: "high" | "medium" | "low";
-    explanation: string;
-  }>;
-  comparables: Array<{
-    company: string;
-    relevance: string;
-    valuation: string | null;
-  }>;
-  overallFinancialHealth: {
-    score: "strong" | "moderate" | "weak" | "insufficient_data";
-    summary: string;
-  };
-  confidence: number;
-  evidenceSources: string[];
-}
+// === Financial analyst output === (see src/lib/types.ts for the full shape)
+// === Brand & market output ===      …
+// === QA output ===                   …
 
-// === Brand & Market Agent Output ===
-interface BrandMarketAnalysis {
-  brandPositioning: {
-    valueProposition: string;
-    targetAudience: string;
-    toneAndPersonality: string;
-    confidence: number;
-  };
-  marketPositioning: {
-    category: string;
-    position: "leader" | "challenger" | "niche" | "emerging";
-    marketShare: string | null;
-    confidence: number;
-  };
-  competitiveAnalysis: {
-    summary: string;
-    competitors: Array<{
-      name: string;
-      strengths: string[];
-      weaknesses: string[];
-      differentiator: string;
-    }>;
-  };
-  sentiment: {
-    overall: "positive" | "neutral" | "negative" | "mixed";
-    signals: Array<{
-      text: string;
-      source: string;
-      sentiment: "positive" | "neutral" | "negative";
-    }>;
-    confidence: number;
-  };
-  brandRisks: Array<{
-    risk: string;
-    severity: "high" | "medium" | "low";
-    explanation: string;
-  }>;
-  growthSignals: Array<{
-    signal: string;
-    type: "hiring" | "product" | "expansion" | "partnership" | "other";
-    source: string;
-  }>;
-  overallBrandHealth: {
-    score: "strong" | "moderate" | "weak" | "insufficient_data";
-    summary: string;
-  };
-  confidence: number;
-  evidenceSources: string[];
-}
-
-// === QA Agent Output ===
-interface QAValidation {
-  overallQualityScore: number;
-  qualityLevel: "high" | "medium" | "low";
-  crossValidation: {
-    alignmentScore: number;
-    contradictions: Array<{
-      between: string;
-      description: string;
-      severity: "high" | "medium" | "low";
-    }>;
-  };
-  confidenceAdjustments: Array<{
-    section: string;
-    originalConfidence: number;
-    adjustedConfidence: number;
-    reason: string;
-  }>;
-  unsupportedClaims: Array<{
-    claim: string;
-    section: string;
-    recommendation: string;
-  }>;
-  criticalGaps: Array<{
-    field: string;
-    importance: "critical" | "important" | "nice_to_have";
-    searchSuggestion: string;
-  }>;
-  recommendations: Array<{
-    action: string;
-    priority: "high" | "medium" | "low";
-  }>;
-  requiresRerun: boolean;
-  rerunInstructions: string | null;
-}
-
-// === Full Analysis State (passed through workflow) ===
+// === Persisted analysis row ===
 interface PythiaAnalysisState {
   input: { companyName: string; url?: string };
   ingestion: RawIngestionResult | null;
@@ -967,250 +360,167 @@ interface PythiaAnalysisState {
   brandMarketAnalysis: BrandMarketAnalysis | null;
   qaValidation: QAValidation | null;
   report: string | null; // Markdown
-  status: "idle" | "ingesting" | "cleaning" | "analyzing" | "validating" | "generating_report" | "complete" | "error";
+  status:
+    | "idle" | "ingesting" | "cleaning" | "analyzing"
+    | "validating" | "generating_report" | "complete" | "error";
   retryCount: number;
   error: string | null;
+  createdAt: string; // ISO
+  chatMessages: Array<{ role: "user" | "assistant"; content: string }>;
+  /** Duration in ms of each completed pipeline step, keyed by status name. */
+  stepDurations: Partial<Record<
+    "ingesting" | "cleaning" | "analyzing" | "validating" | "generating_report",
+    number
+  >>;
 }
 ```
 
+The Zod schemas and TypeScript types are maintained manually in lockstep. A fixture-based round-trip test (`src/mastra/schemas.test.ts`) catches shape drift.
+
+---
+
 ## Mastra Implementation Details
 
-### Agent Definitions
+### Structured output helper
 
-```typescript
-import { Agent } from "@mastra/core/agent";
-import { openai } from "@ai-sdk/openai";
+Mastra exposes `structuredOutput: { schema }` on `agent.generate()`. In practice models occasionally return a validly-shaped `.object` with an empty `.text`, or the reverse, or fence their JSON with ```` ```json ... ``` ````. The `generateStructured` helper in `src/mastra/lib/structured-generate.ts` normalizes all three cases:
 
-// Each agent is defined as a Mastra Agent with its system prompt and tools
+1. Prefer the parsed `.object` if it validates against the schema.
+2. Otherwise strip code fences from `.text`, `JSON.parse`, and validate.
+3. If neither path yields a valid object, throw a descriptive error naming the agent.
 
-const ingestionAgent = new Agent({
-  name: "ingestion-agent",
-  instructions: `...`, // Full system prompt from Agent Definitions section above
-  model: openai("gpt-4o"),
-  tools: {
-    webSearch: tavilySearchTool,
-  },
-});
+### Shared pipeline primitives
 
-const dataEngineerAgent = new Agent({
-  name: "data-engineer-agent",
-  instructions: `...`,
-  model: openai("gpt-4o"),
-});
+`src/mastra/lib/pipeline.ts` exposes `runCleanData`, `runFinancial`, `runBrand`, `runParallelAnalysis`, and `runValidation`. Each does the LLM call, schema validation, and `updateAnalysis` persistence, and returns `{ object, text }`. Both the main workflow's steps and the conditional retry branch use these primitives — so a prompt tweak is a one-file change.
 
-const financialAnalystAgent = new Agent({
-  name: "financial-analyst-agent",
-  instructions: `...`,
-  model: openai("gpt-4o"),
-  tools: {
-    webSearch: tavilySearchTool,
-  },
-});
+### Typed agent lookup
 
-const brandMarketAgent = new Agent({
-  name: "brand-market-agent",
-  instructions: `...`,
-  model: openai("gpt-4o"),
-  tools: {
-    webSearch: tavilySearchTool,
-  },
-});
+`src/mastra/lib/agents.ts` exports an `AGENT_IDS` const and a `getAgent(mastra, "brandMarket")` helper. Misspellings become TypeScript errors instead of runtime `undefined`s.
 
-const qaValidatorAgent = new Agent({
-  name: "qa-validator-agent",
-  instructions: `...`,
-  model: openai("gpt-4o"),
-});
+### Workflow definition (sketch)
 
-const reportAgent = new Agent({
-  name: "report-agent",
-  instructions: `...`,
-  model: openai("gpt-4o"),
-});
-
-const chatAgent = new Agent({
-  name: "chat-agent",
-  instructions: `...`, // Dynamic — context injected at runtime
-  model: openai("gpt-4o"),
-});
-```
-
-### Workflow Definition
-
-```typescript
-import { Workflow, Step } from "@mastra/core/workflows";
-import { z } from "zod";
-
-// Step definitions
-const ingestStep = new Step({
-  id: "ingest",
-  execute: async ({ context }) => {
-    const { companyName, url } = context.triggerData;
-    const result = await ingestionAgent.generate(
-      `Research the company: ${companyName}${url ? ` (website: ${url})` : ""}`
-    );
-    return { ingestion: JSON.parse(result.text) };
-  },
-});
-
-const cleanDataStep = new Step({
-  id: "clean-data",
-  execute: async ({ context }) => {
-    const ingestion = context.getStepResult("ingest").ingestion;
-    const result = await dataEngineerAgent.generate(
-      `Clean and structure this raw company data:\n${JSON.stringify(ingestion)}`
-    );
-    return { companyProfile: JSON.parse(result.text) };
-  },
-});
-
-const financialAnalysisStep = new Step({
-  id: "financial-analysis",
-  execute: async ({ context }) => {
-    const profile = context.getStepResult("clean-data").companyProfile;
-    const result = await financialAnalystAgent.generate(
-      `Analyze the financials of this company:\n${JSON.stringify(profile)}`
-    );
-    return { financialAnalysis: JSON.parse(result.text) };
-  },
-});
-
-const brandAnalysisStep = new Step({
-  id: "brand-analysis",
-  execute: async ({ context }) => {
-    const profile = context.getStepResult("clean-data").companyProfile;
-    const result = await brandMarketAgent.generate(
-      `Analyze the brand and market position of this company:\n${JSON.stringify(profile)}`
-    );
-    return { brandMarketAnalysis: JSON.parse(result.text) };
-  },
-});
-
-const qaValidationStep = new Step({
-  id: "qa-validation",
-  execute: async ({ context }) => {
-    const profile = context.getStepResult("clean-data").companyProfile;
-    const financial = context.getStepResult("financial-analysis").financialAnalysis;
-    const brand = context.getStepResult("brand-analysis").brandMarketAnalysis;
-    const result = await qaValidatorAgent.generate(
-      `Validate this analysis:\nProfile: ${JSON.stringify(profile)}\nFinancial: ${JSON.stringify(financial)}\nBrand: ${JSON.stringify(brand)}`
-    );
-    return { qaValidation: JSON.parse(result.text) };
-  },
-});
-
-const reportGenerationStep = new Step({
-  id: "generate-report",
-  execute: async ({ context }) => {
-    const profile = context.getStepResult("clean-data").companyProfile;
-    const financial = context.getStepResult("financial-analysis").financialAnalysis;
-    const brand = context.getStepResult("brand-analysis").brandMarketAnalysis;
-    const qa = context.getStepResult("qa-validation").qaValidation;
-    const result = await reportAgent.generate(
-      `Generate the intelligence report:\nProfile: ${JSON.stringify(profile)}\nFinancial: ${JSON.stringify(financial)}\nBrand: ${JSON.stringify(brand)}\nQA: ${JSON.stringify(qa)}`
-    );
-    return { report: result.text };
-  },
-});
-
-// Workflow assembly
-const pythiaWorkflow = new Workflow({
-  name: "pythia-analysis",
-  triggerSchema: z.object({
+```ts
+// src/mastra/workflows/pythia-analysis.ts
+export const pythiaWorkflow = createWorkflow({
+  id: "pythia-analysis",
+  inputSchema: z.object({
     companyName: z.string(),
     url: z.string().optional(),
+    analysisId: z.string(),
   }),
+  outputSchema: z.object({ text: z.string() }),
+  steps: [
+    ingestStep,
+    cleanDataStep,
+    financialAnalysisStep,
+    brandAnalysisStep,
+    qaValidationStep,
+    conditionalRetryStep,
+    reportGenerationStep,
+  ],
 })
-  .step(ingestStep)
+  .then(ingestStep)
   .then(cleanDataStep)
-  .then(financialAnalysisStep)
-  .then(brandAnalysisStep)
-  .after([financialAnalysisStep, brandAnalysisStep])
-  .step(qaValidationStep)
+  .parallel([financialAnalysisStep, brandAnalysisStep])
+  .then(qaValidationStep)
+  .then(conditionalRetryStep)
   .then(reportGenerationStep)
   .commit();
 ```
 
-### Tool Definitions
+Each step calls `updateAnalysis(id, { status: "…" })` on entry, runs its pipeline primitive, records `stepDurations` via the updater-function overload, and returns the shared payload shape.
 
-### Mastra Instance Registration
+### Store & streaming
 
-```typescript
-import { Mastra } from "@mastra/core";
+`src/lib/store.ts` wraps `better-sqlite3` with:
 
-const mastra = new Mastra({
-  agents: {
-    ingestionAgent,
-    dataEngineerAgent,
-    financialAnalystAgent,
-    brandMarketAgent,
-    qaValidatorAgent,
-    reportAgent,
-    chatAgent,
-  },
-  workflows: {
-    pythiaAnalysis: pythiaWorkflow,
-  },
-});
+- Prepared statements cached at module scope
+- A synchronous transaction around every `updateAnalysis` (read-modify-write can't race)
+- An **updater-function overload** so parallel steps can safely merge nested objects: `updateAnalysis(id, prev => ({ stepDurations: { ...prev.stepDurations, foo: 123 } }))`
+- A module-level `EventEmitter` — `subscribeAnalysis(id, listener)` is what the SSE route calls
 
-export { mastra };
-```
+Next.js hot reloading preserves the DB handle and event bus via globalThis-stashed singletons.
+
+### Timeouts
+
+The `/api/analyze` route wraps `run.start(…)` in `Promise.race` against a 15-minute timeout, so a stuck upstream API never leaves a row permanently "in progress".
+
+---
 
 ## Frontend Specification
 
-### Pages & Routes
+### Pages & routes
 
+| Route | Description |
+| --- | --- |
+| `/` | Landing page: company input + disambiguation flow + recent analyses |
+| `/analyses` | Full list of past analyses |
+| `/analysis/[id]` | Live agent pipeline, Markdown report, chat, PDF download |
 
-| Route            | Description                                              |
-| ---------------- | -------------------------------------------------------- |
-| `/`              | Landing page with company input form                     |
-| `/analysis/[id]` | Analysis view with agent activity feed, report, and chat |
+### API routes
 
+| Route | Purpose |
+| --- | --- |
+| `POST /api/disambiguate` | Returns up to 4 candidates (or `[]` if unambiguous) |
+| `POST /api/analyze` | Creates a row and starts the workflow. Returns `{ id }` immediately. |
+| `GET /api/analysis/[id]/status` | Current `PythiaAnalysisState`. Used for non-streaming fallback. |
+| `GET /api/analysis/[id]/stream` | SSE stream of state updates for this id. |
+| `POST /api/analysis/[id]/chat` | Chat turn. Atomically appends user + assistant messages. |
+| `GET /api/analyses` | List of all rows (id, name, status, createdAt) for the sidebar. |
 
-### UI Layout for /analysis/[id]
+### Key components
 
-```
-┌────────────────────────────────────────────────────────┐
-│   Header: Pythia | New Search | Analyzing: Company     │
-└────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-┌────────────────────────────────────────────────────────┐
-│   Agent Activity Panel                                 │
-│   (agent status + timings)                             │
-└───────────────────────┬────────────────────────────────┘
-                        │
-            ┌───────────┴──────────┐
-            ▼                      ▼
-┌─────────────────────┐  ┌─────────────────────────────┐
-│   Report Viewer     │  │       Chat Panel            │
-│ summary, financials │  │  Q&A with grounded sources  │
-│   market, risks     │  │                             │
-└─────────────────────┘  └─────────────────────────────┘
-```
+| Component | Role |
+| --- | --- |
+| `components/company-input.tsx` | Input form with disambiguation candidates |
+| `components/agent-activity-feed.tsx` | Live per-step status with elapsed-time timer and final durations |
+| `components/report-viewer.tsx` | Renders the Markdown report with confidence badges |
+| `components/chat-panel.tsx` | Grounded Q&A. Input sits near hints when empty and expands with conversation. |
+| `components/recent-analyses.tsx` | Recent-runs sidebar/list |
+| `components/confidence-badge.tsx` | `<ConfidenceBadge score={0.82} />` — colored pill |
 
+### State management
 
+- SSE is primary: `EventSource("/api/analysis/:id/stream")`.
+- `GET /api/analysis/:id/status` is the one-shot fallback when the tab is opened mid-run.
+- Once `status === "complete"`, the UI stops subscribing and renders the report + enables chat.
 
-### Key UI Components
+### Styling & UX
 
-1. `**CompanyInput**` — Search bar with company name input and optional URL field. Submit triggers the workflow.
-2. `**AgentActivityFeed**` — Real-time feed showing which agent is active, completed, or queued. Each row shows agent name, status icon, and timing. Updates via polling or server-sent events.
-3. `**ReportViewer**` — Renders the Markdown report with styled confidence indicators (🟢🟡🔴). Collapsible sections. Source links are clickable.
-4. `**ChatPanel**` — Chat interface for conversational Q&A. Messages are grounded in collected data. Shows source references inline.
-5. `**ConfidenceBadge**` — Reusable component: `<ConfidenceBadge score={0.82} />` renders as colored badge with score.
+- Tailwind 4 dark theme — the "intelligence terminal" aesthetic.
+- Monospace font for numeric/structured data.
+- PDF export uses `html2canvas-pro` to snapshot the report viewer and `jspdf` to produce a download — purely client-side, no server roundtrip.
 
-### State Management
+---
 
-- Use React state + polling for MVP (poll /api/analysis/[id]/status every 2 seconds)
-- The API returns the current PythiaAnalysisState which drives all UI updates
-- When status === "complete", stop polling and render the full report + enable chat
+## Testing & Evals
 
-### Styling
+### Unit tests — `npm test`
 
-- Tailwind CSS
-- Dark theme preferred (feels like an intelligence/analyst tool)
-- Monospace font for data/numbers
-- Clean, minimal layout — the data is the hero
+Vitest, Node environment, 89 tests in ~180ms. Covers:
+
+- **`src/lib/disambiguate.test.ts`** — every pure helper (`norm`, `getRootDomain`, `domainMatchesTerm`, `titleToName`, `isSameCompany`, `isCloseEnough`) plus orchestration with a mocked Tavily client (Tesla dominance, Apple vs. Apple Records, xAI same-entity collapse, reference-site filtering).
+- **`src/lib/store.test.ts`** — CRUD, both `updateAnalysis` overloads including the explicit race test for the updater form, listing, delete, pub/sub. Each test uses a temp directory via `process.cwd` rebind + `vi.resetModules()` so the SQLite singleton is fresh.
+- **`src/mastra/schemas.test.ts`** — fixture round-trip through all four Zod schemas plus negative cases (wrong enums, missing keys, wrong types).
+- **`src/mastra/lib/structured-generate.test.ts`** — prefer-`.object`, fallback-to-`.text`, fence stripping, invalid-object falls through to text, JSON parse errors, schema validation errors, empty responses.
+- **`evals/scorers.test.ts`** — unit tests for every eval scorer, deliberately runnable in the default test pass so a scorer refactor fails `npm test` before you burn money on a real eval run.
+
+### Evals — `npm run evals`
+
+Opt-in harness at `evals/`. Drives the full `pythiaWorkflow` against a fixture pack (famous / recently-funded / obscure company archetypes) and scores each run with six deterministic scorers:
+
+| Scorer | What it checks |
+| --- | --- |
+| `schemaValid` | All four structured outputs round-trip through their schemas. **Hard gate** (non-zero exit on failure). |
+| `sourcesCount` | Data engineer retained enough sources (≥ 8 for famous, ≥ 3 for obscure). |
+| `confidenceVariance` | Confidence values show healthy spread — not uniform filler. |
+| `wellKnownBackfill` | Fixture-specific hints (founded year, HQ, competitors) show up in the profile. |
+| `gracefulDegradation` | On obscure fixtures, the output has low confidence + declared gaps (inverts the usual polarity — hallucinated certainty is the failure mode). |
+| `qaAlignment` | The QA validator's own quality score as a first-class signal. |
+
+Writes a Markdown report to `evals/reports/<timestamp>.md`. `EVAL_FILTER=stripe,anthropic` filters to specific fixtures for iteration.
+
+---
 
 ## Project Structure
 
@@ -1219,53 +529,80 @@ pythia/
 ├── src/
 │   ├── app/
 │   │   ├── layout.tsx
-│   │   ├── page.tsx
-│   │   ├── analysis/[id]/page.tsx
+│   │   ├── page.tsx                          # Landing + recent analyses
+│   │   ├── globals.css
+│   │   ├── analyses/page.tsx                 # Full history
+│   │   ├── analysis/[id]/page.tsx            # Live run + report + chat
 │   │   └── api/
-│   │       ├── analyze/route.ts
-│   │       ├── analysis/[id]/status/route.ts
-│   │       ├── analysis/[id]/chat/route.ts
-│   │       └── mastra/
-│   ├── mastra/
-│   │   ├── index.ts
-│   │   ├── agents/
-│   │   │   ├── ingestion.ts
-│   │   │   ├── data-engineer.ts
-│   │   │   ├── financial-analyst.ts
-│   │   │   ├── brand-market.ts
-│   │   │   ├── qa-validator.ts
-│   │   │   ├── report.ts
-│   │   │   └── chat.ts
-│   │   ├── tools/
-│   │   │   ├── web-search.ts
-│   │   │   └── scrape-url.ts
-│   │   └── workflows/
-│   │       └── pythia-analysis.ts
+│   │       ├── analyses/route.ts             # GET list
+│   │       ├── analyze/route.ts              # POST → kick off workflow
+│   │       ├── disambiguate/route.ts         # POST → candidates
+│   │       └── analysis/[id]/
+│   │           ├── _helpers.ts
+│   │           ├── status/route.ts           # GET current state
+│   │           ├── stream/route.ts           # SSE
+│   │           └── chat/route.ts             # POST chat turn
 │   ├── components/
-│   │   ├── company-input.tsx
 │   │   ├── agent-activity-feed.tsx
-│   │   ├── report-viewer.tsx
 │   │   ├── chat-panel.tsx
-│   │   └── confidence-badge.tsx
+│   │   ├── company-input.tsx
+│   │   ├── confidence-badge.tsx
+│   │   ├── recent-analyses.tsx
+│   │   └── report-viewer.tsx
 │   ├── lib/
+│   │   ├── disambiguate.ts         + .test.ts
+│   │   ├── env.ts
+│   │   ├── store.ts                + .test.ts
 │   │   └── types.ts
-│   └── styles/
-│       └── globals.css
-├── .env.local
+│   └── mastra/
+│       ├── index.ts                          # Mastra instance
+│       ├── schemas.ts              + .test.ts
+│       ├── agents/
+│       │   ├── brand-market.ts
+│       │   ├── chat.ts
+│       │   ├── data-engineer.ts
+│       │   ├── financial-analyst.ts
+│       │   ├── qa-validator.ts
+│       │   └── report.ts
+│       ├── lib/
+│       │   ├── agents.ts                     # Typed agent getter
+│       │   ├── pipeline.ts                   # Shared primitives
+│       │   └── structured-generate.ts  + .test.ts
+│       ├── prompts/
+│       │   └── confidence.ts                 # Shared prompt fragments
+│       ├── tools/
+│       │   ├── ingestion-runner.ts           # Deterministic Tavily runner
+│       │   └── web-search.ts                 # Tool for financial/brand agents
+│       └── workflows/
+│           └── pythia-analysis.ts
+├── evals/
+│   ├── fixtures.ts
+│   ├── scorers.ts             + .test.ts
+│   ├── run-evals.ts
+│   ├── tsconfig.json
+│   └── README.md
+├── .data/                      # SQLite file(s) — gitignored
+├── vitest.config.ts
+├── AGENTS.md                   # Repo-level agent notes (Next 16 warning)
+├── CLAUDE.md                   # Points at AGENTS.md
 ├── package.json
 ├── tsconfig.json
-├── tailwind.config.ts
+├── postcss.config.mjs
 ├── next.config.ts
 └── README.md
 ```
 
-
+---
 
 ## Key Design Principles
 
-1. **Transparency over polish** — Every claim has a confidence score and source. The QA section is visible, not hidden. Users should trust the tool because it shows its work.
-2. **Graceful degradation** — If an agent fails or data is sparse, the system still produces a report with clear "insufficient data" markers rather than crashing or hallucinating.
-3. **Visible orchestration** — The agent activity feed isn't just a loading spinner. It shows the multi-agent collaboration in real time, which is both useful and impressive for demos.
-4. **Grounded chat** — The chat agent ONLY uses collected data. It should refuse to speculate beyond what the analysis found, maintaining trust.
-5. **Idempotent and stateless** — Each analysis run is independent. No persistent database needed for MVP. State lives in the workflow execution.
-
+1. **Determinism where it helps, LLM where it helps** — ingestion and disambiguation are pure code, because those stages benefit from predictability and speed more than from reasoning. Cleaning, analysis, validation, and report-writing are agents, because those stages benefit from open-ended reasoning.
+2. **Structured output everywhere** — every LLM call that produces data goes through `generateStructured` with a Zod schema. A malformed model response fails loudly instead of silently polluting the state.
+3. **Atomic state updates** — `updateAnalysis` wraps every mutation in a SQLite transaction. The updater-function overload means parallel steps (financial + brand) can safely merge nested fields without racing.
+4. **Transparency over polish** — Every claim has a confidence score and source list. The QA section is rendered in the report, not hidden. Users should trust the tool because it shows its work.
+5. **Graceful degradation** — If a stage produces thin results, the downstream agents receive honest gaps and low confidences rather than confident hallucinations. The `gracefulDegradation` eval scorer pins this behaviour for obscure companies.
+6. **Visible orchestration** — The activity feed shows each step transitioning in real time, with elapsed times and final durations. This is both useful as UX and strongly diagnostic when a step hangs.
+7. **Grounded chat** — The chat agent reads the persisted analysis state and nothing else. It should refuse to speculate past what the analysis found.
+8. **Single-process SSE, not Redis** — The in-process `EventEmitter` is enough for MVP and keeps deployment trivial. Swapping in a real pub/sub layer later is a localized change in `store.ts`.
+9. **Local-first persistence** — `.data/analyses.sqlite` keeps the MVP dead-simple to run. A serverless deployment would need to swap the storage layer — SQLite on an ephemeral filesystem is not a production pattern.
+10. **Evals as a separate budget** — Unit tests are free and fast and run on every commit. Evals hit real APIs and cost real money, so they live behind an explicit `npm run evals` gate with filterable fixtures.

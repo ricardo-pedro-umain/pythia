@@ -1,5 +1,4 @@
 import { Mastra } from "@mastra/core";
-import { ingestionAgent } from "./agents/ingestion";
 import { dataEngineerAgent } from "./agents/data-engineer";
 import { financialAnalystAgent } from "./agents/financial-analyst";
 import { brandMarketAgent } from "./agents/brand-market";
@@ -10,7 +9,6 @@ import { pythiaWorkflow } from "./workflows/pythia-analysis";
 
 export const mastra = new Mastra({
   agents: {
-    ingestionAgent,
     dataEngineerAgent,
     financialAnalystAgent,
     brandMarketAgent,

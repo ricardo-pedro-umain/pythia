@@ -6,12 +6,18 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "evals": "tsx --tsconfig evals/tsconfig.json evals/run-evals.ts"
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.53",
     "@mastra/core": "^1.25.0",
     "@tavily/core": "^0.7.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.9.0",
     "html2canvas-pro": "^2.0.2",
     "jspdf": "^4.2.1",
     "next": "16.2.4",
@@ -25,9 +31,12 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitest/coverage-v8": "^4.1.5",
     "eslint": "^9",
     "eslint-config-next": "16.2.4",
     "tailwindcss": "^4",
-    "typescript": "^5.9.3"
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.5"
   }
 }

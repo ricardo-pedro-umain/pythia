@@ -1,6 +1,49 @@
 "use client";
 
 import { useRef, useEffect } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+
+// Compact markdown styles tuned for the chat panel — tighter spacing than
+// the report viewer, and headings downsized so an LLM that emits "### Foo"
+// doesn't produce a giant title inside a chat bubble.
+const chatMarkdownComponents: Components = {
+  a: ({ href, children }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-accent underline decoration-accent/30 hover:decoration-accent/70"
+    >
+      {children}
+    </a>
+  ),
+  h1: ({ children }) => <p className="text-sm font-semibold text-foreground mb-1">{children}</p>,
+  h2: ({ children }) => <p className="text-sm font-semibold text-foreground mb-1">{children}</p>,
+  h3: ({ children }) => <p className="text-sm font-semibold text-foreground mb-1">{children}</p>,
+  h4: ({ children }) => <p className="text-sm font-semibold text-foreground mb-1">{children}</p>,
+  h5: ({ children }) => <p className="text-sm font-semibold text-foreground mb-1">{children}</p>,
+  h6: ({ children }) => <p className="text-sm font-semibold text-foreground mb-1">{children}</p>,
+  p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+  ul: ({ children }) => <ul className="list-disc pl-5 mb-2 last:mb-0 space-y-0.5">{children}</ul>,
+  ol: ({ children }) => <ol className="list-decimal pl-5 mb-2 last:mb-0 space-y-0.5">{children}</ol>,
+  li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+  strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+  em: ({ children }) => <em className="italic">{children}</em>,
+  code: ({ children }) => (
+    <code className="rounded bg-muted/50 px-1 py-0.5 text-[0.85em] font-mono">{children}</code>
+  ),
+  pre: ({ children }) => (
+    <pre className="rounded bg-muted/50 px-2 py-1.5 text-[0.85em] font-mono overflow-x-auto mb-2">
+      {children}
+    </pre>
+  ),
+  blockquote: ({ children }) => (
+    <blockquote className="border-l-2 border-accent/40 pl-3 italic text-muted-foreground/80 mb-2">
+      {children}
+    </blockquote>
+  ),
+  hr: () => <hr className="my-2 border-border/40" />,
+};
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -8,7 +51,6 @@ export interface ChatMessage {
 }
 
 interface ChatPanelProps {
-  analysisId: string;
   messages: ChatMessage[];
   onSendMessage: (message: string) => void;
   loading: boolean;
@@ -17,7 +59,6 @@ interface ChatPanelProps {
 }
 
 export function ChatPanel({
-  analysisId: _analysisId,
   messages,
   onSendMessage,
   loading,
@@ -105,7 +146,15 @@ export function ChatPanel({
               <p className="text-[10px] font-semibold uppercase tracking-wider mb-1 opacity-50">
                 {msg.role === "user" ? "You" : "Pythia"}
               </p>
-              <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+              {msg.role === "user" ? (
+                <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+              ) : (
+                <div className="chat-prose">
+                  <ReactMarkdown components={chatMarkdownComponents}>
+                    {msg.content}
+                  </ReactMarkdown>
+                </div>
+              )}
             </div>
           ))}
           {loading && (

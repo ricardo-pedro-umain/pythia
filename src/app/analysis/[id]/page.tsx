@@ -27,10 +27,10 @@ export default function AnalysisPage({
   const [analysis, setAnalysis] = useState<PythiaAnalysisState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showChat, setShowChat] = useState(true);
-  const [downloading, setDownloading] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
+  const chatSeededRef = useRef(false);
   const reportRef = useRef<HTMLDivElement>(null);
 
   const handleSendMessage = useCallback(async (message: string) => {
@@ -63,74 +63,104 @@ export default function AnalysisPage({
   }, [id]);
 
   useEffect(() => {
-    let active = true;
+    // Server-Sent Events stream — the server pushes a fresh
+    // PythiaAnalysisState snapshot on every store update and closes the
+    // connection once the analysis reaches a terminal state.
+    const es = new EventSource(`/api/analysis/${id}/stream`);
 
-    async function poll() {
+    es.onmessage = (event) => {
       try {
-        const res = await fetch(`/api/analysis/${id}/status`);
-        if (!res.ok) {
-          setError("Analysis not found");
-          return;
+        const data: PythiaAnalysisState = JSON.parse(event.data);
+        setAnalysis(data);
+        // Seed chat history from the server exactly once so we don't
+        // clobber in-flight local messages on later updates.
+        if (!chatSeededRef.current && data.chatMessages?.length) {
+          setChatMessages(data.chatMessages);
         }
-        const data: PythiaAnalysisState = await res.json();
-        if (active) {
-          setAnalysis(data);
-          if (data.status !== "complete" && data.status !== "error") {
-            setTimeout(poll, 2000);
-          }
-        }
+        chatSeededRef.current = true;
       } catch {
-        if (active) setError("Failed to fetch analysis status");
+        /* malformed frame — ignore */
       }
-    }
+    };
 
-    poll();
+    es.onerror = () => {
+      // The browser auto-reconnects by default. Only surface an error if
+      // we never received any state at all (e.g. 404 at open time).
+      setAnalysis((prev) => {
+        if (!prev) setError("Failed to fetch analysis status");
+        return prev;
+      });
+    };
+
     return () => {
-      active = false;
+      es.close();
     };
   }, [id]);
 
-  const handleDownloadPdf = useCallback(async () => {
-    if (!reportRef.current || downloading) return;
-    setDownloading(true);
+  const handleDownloadPdf = useCallback(() => {
+    if (!reportRef.current) return;
 
-    try {
-      const html2canvas = (await import("html2canvas-pro")).default;
-      const { jsPDF } = await import("jspdf");
+    // Extract the rendered report HTML (inside the report-prose wrapper)
+    const prose = reportRef.current.querySelector(".report-prose");
+    const bodyHtml = prose ? prose.innerHTML : reportRef.current.innerHTML;
+    const company = analysis?.input.companyName ?? "Report";
 
-      // Report already has a light paper-like theme, capture directly
-      const canvas = await html2canvas(reportRef.current, {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: "#f0eeeb",
-      });
+    // Open a minimal print window that carries only light-theme styles —
+    // completely bypasses the dark app theme that was causing html2canvas issues.
+    const win = window.open("", "_blank", "width=900,height=700");
+    if (!win) return;
 
-      const imgWidth = 190;
-      const pageHeight = 277;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
-      const pdf = new jsPDF("p", "mm", "a4");
-
-      let heightLeft = imgHeight;
-      let position = 10;
-
-      pdf.addImage(canvas.toDataURL("image/png"), "PNG", 10, position, imgWidth, imgHeight);
-      heightLeft -= pageHeight;
-
-      while (heightLeft > 0) {
-        position = heightLeft - imgHeight + 10;
-        pdf.addPage();
-        pdf.addImage(canvas.toDataURL("image/png"), "PNG", 10, position, imgWidth, imgHeight);
-        heightLeft -= pageHeight;
-      }
-
-      const companyName = analysis?.input.companyName?.replace(/\s+/g, "_") ?? "report";
-      pdf.save(`Pythia_${companyName}.pdf`);
-    } catch (err) {
-      console.error("PDF generation failed:", err);
-    } finally {
-      setDownloading(false);
+    win.document.write(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pythia — ${company}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { font-size: 14px; }
+    body {
+      background: #f0eeeb;
+      color: #44403c;
+      font-family: Georgia, 'Times New Roman', serif;
+      padding: 48px 56px;
+      line-height: 1.7;
     }
-  }, [analysis, downloading]);
+    h1 { font-size: 1.75rem; margin-top: 0; margin-bottom: 1rem; color: #1c1917; font-family: system-ui, sans-serif; }
+    h2 { font-size: 1.2rem; margin-top: 2rem; margin-bottom: 0.75rem; padding-bottom: 0.5rem; border-bottom: 1px solid #d6d3d1; color: #1c1917; font-family: system-ui, sans-serif; }
+    h3 { font-size: 1.05rem; margin-top: 1.5rem; margin-bottom: 0.5rem; color: #292524; font-family: system-ui, sans-serif; }
+    h4, h5, h6 { margin-top: 1rem; margin-bottom: 0.5rem; color: #292524; font-family: system-ui, sans-serif; }
+    p { margin-bottom: 0.75rem; }
+    ul, ol { margin-bottom: 0.75rem; padding-left: 1.5rem; }
+    li { margin-bottom: 0.25rem; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; font-size: 0.875rem; font-family: system-ui, sans-serif; }
+    th { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 2px solid #d6d3d1; color: #1c1917; font-weight: 600; }
+    td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #e7e5e4; color: #57534e; }
+    blockquote { border-left: 3px solid #6366f1; padding-left: 1rem; margin-left: 0; color: #78716c; font-style: italic; margin-bottom: 0.75rem; }
+    code { font-family: monospace; font-size: 0.85em; background: #f5f5f4; padding: 0.15rem 0.4rem; border-radius: 0.25rem; color: #44403c; }
+    pre { background: #f5f5f4; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; margin-bottom: 0.75rem; }
+    a { color: #4f46e5; text-decoration: none; }
+    strong { color: #1c1917; font-weight: 600; }
+    em { font-style: italic; }
+    hr { border: none; border-top: 1px solid #d6d3d1; margin: 1.5rem 0; }
+    @media print {
+      body { padding: 0; background: white; }
+      @page { margin: 1.8cm; size: A4; }
+      h2 { page-break-after: avoid; }
+      h3 { page-break-after: avoid; }
+      table { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>${bodyHtml}</body>
+</html>`);
+    win.document.close();
+
+    // Give the browser a moment to finish rendering, then trigger print/save.
+    setTimeout(() => {
+      win.focus();
+      win.print();
+    }, 400);
+  }, [analysis]);
 
   if (error) {
     return (
@@ -191,20 +221,12 @@ export default function AnalysisPage({
           {isComplete && (
             <button
               onClick={handleDownloadPdf}
-              disabled={downloading}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-xs font-medium text-white transition-all hover:bg-accent/90 disabled:opacity-50 hidden sm:inline-flex"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-xs font-medium text-white transition-all hover:bg-accent/90 hidden sm:inline-flex"
             >
-              {downloading ? (
-                <svg className="h-3.5 w-3.5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                </svg>
-              ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
-                  <path d="M2.75 14a.75.75 0 0 1 0-1.5h10.5a.75.75 0 0 1 0 1.5H2.75ZM8.75 1.75a.75.75 0 0 0-1.5 0v7.19L5.53 7.22a.75.75 0 0 0-1.06 1.06l3 3a.75.75 0 0 0 1.06 0l3-3a.75.75 0 1 0-1.06-1.06L8.75 8.94V1.75Z" />
-                </svg>
-              )}
-              {downloading ? "Generating..." : "Download PDF"}
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
+                <path d="M2.75 14a.75.75 0 0 1 0-1.5h10.5a.75.75 0 0 1 0 1.5H2.75ZM8.75 1.75a.75.75 0 0 0-1.5 0v7.19L5.53 7.22a.75.75 0 0 0-1.06 1.06l3 3a.75.75 0 0 0 1.06 0l3-3a.75.75 0 1 0-1.06-1.06L8.75 8.94V1.75Z" />
+              </svg>
+              Download PDF
             </button>
           )}
           {isComplete && (
@@ -222,7 +244,11 @@ export default function AnalysisPage({
       <div className="flex flex-1 min-h-0 overflow-hidden flex-col lg:flex-row">
         {/* Left sidebar — Agent Activity */}
         <aside className="w-full lg:w-72 xl:w-80 shrink-0 border-b lg:border-b-0 lg:border-r border-border p-4 sm:p-5 overflow-y-auto">
-          <AgentActivityFeed status={analysis.status} retryCount={analysis.retryCount} />
+          <AgentActivityFeed
+            status={analysis.status}
+            retryCount={analysis.retryCount}
+            stepDurations={analysis.stepDurations}
+          />
 
           {analysis.status === "error" && analysis.error && (
             <div className="mt-4 rounded-lg bg-red-500/10 border border-red-500/30 px-3 py-2.5 animate-fade-in">
@@ -278,7 +304,6 @@ export default function AnalysisPage({
         {isComplete && showChat && (
           <aside className="w-full lg:w-80 xl:w-96 shrink-0 border-t lg:border-t-0 lg:border-l border-border p-4 sm:p-5 flex flex-col min-h-0 max-h-[400px] lg:max-h-none">
             <ChatPanel
-              analysisId={id}
               messages={chatMessages}
               onSendMessage={handleSendMessage}
               loading={chatLoading}
