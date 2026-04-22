@@ -6,7 +6,7 @@
 // that way adding a new required var is a single-location change and typos
 // like TAVILY_API_KY become TypeScript errors instead of silent nulls.
 
-const REQUIRED_KEYS = ["TAVILY_API_KEY", "OPENAI_API_KEY"] as const;
+const REQUIRED_KEYS = ["TAVILY_API_KEY"] as const;
 
 type RequiredKey = (typeof REQUIRED_KEYS)[number];
 

@@ -55,12 +55,20 @@ export function getDomainBase(rootDomain: string): string {
  * overlaps with the query — either direction prefix match. This filters out
  * reference sites (britannica.com, ebsco.com) that happen to host a page
  * about the company.
+ *
+ * Three cases pass:
+ *   base.startsWith(t)  — "tesla" matches "teslamotors.com"
+ *   t.startsWith(base)  — "saltai" (base of saltai.io) is a prefix of "salt" search? No,
+ *                         actually this catches the reverse: search term starts with base,
+ *                         e.g. searching "saltai" finds "salt.io"
+ *   base.includes(t)    — "getsalt" contains "salt"; catches domains like getsalt.io
+ *                         that don't start with the search term but embed it
  */
 export function domainMatchesTerm(rootDomain: string, term: string): boolean {
   const base = getDomainBase(rootDomain);
   const t = norm(term);
   if (!base || !t) return false;
-  return base.startsWith(t) || t.startsWith(base);
+  return base.startsWith(t) || t.startsWith(base) || base.includes(t);
 }
 
 /** Strip boilerplate from page titles to get a company name. */
@@ -172,15 +180,21 @@ export async function disambiguateCompany(
 
   // ── Confidence check ───────────────────────────────────────────────────
   // Skip disambiguation only when the top result is *dominant* — i.e. it
-  // scores meaningfully higher than the runner-up.  A high absolute score
-  // alone is NOT sufficient: "Salt" returns salt.ch at 0.77+ because that IS
-  // a very relevant result, but saltai.io is close behind.  The ratio test
-  // correctly captures single-entity dominance (Tesla, SpaceX, Stripe…) while
-  // letting genuinely ambiguous names through.
+  // scores very highly in absolute terms AND is at least 2× the runner-up.
+  //
+  // The original 0.6 / 1.6× thresholds were too loose: "Salt" (the Swiss
+  // telecom salt.ch) scores 0.77+ which easily cleared 0.6, and saltai.io
+  // scores ~0.55 giving a ratio of 1.4 — which correctly does NOT clear
+  // 1.6×, but in practice Tavily sometimes doesn't return saltai.io at all,
+  // leaving salt.ch as the sole survivor and returning [] incorrectly.
+  //
+  // Raising to 0.85 / 2.0× means only genuinely unambiguous household-name
+  // companies (Tesla, Stripe, Anthropic) clear the bar. Anything ambiguous
+  // or moderately famous shows the picker.
   const topScore = ranked.length > 0 ? ranked[0][1].score : 0;
   const secondScore = ranked.length > 1 ? ranked[1][1].score : 0;
 
-  if (ranked.length <= 1 || (topScore >= 0.6 && topScore >= secondScore * 1.6)) {
+  if (ranked.length <= 1 || (topScore >= 0.85 && topScore >= secondScore * 2.0)) {
     return [];
   }
 

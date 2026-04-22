@@ -61,7 +61,9 @@ Pythia is an end-to-end multi-agent application that performs automated company 
 - `OPENAI_API_KEY` — for GPT-4o
 - `TAVILY_API_KEY` — for web search
 
-Both are validated lazily via a Proxy in `src/lib/env.ts`. Missing keys throw a descriptive error at first use rather than at build time, so `next build` still runs on a machine without secrets.
+`TAVILY_API_KEY` is validated lazily via a Proxy in `src/lib/env.ts` — missing keys throw a descriptive error at first use rather than at build time, so `next build` still runs on a machine without secrets.
+
+`OPENAI_API_KEY` is validated directly in `src/mastra/index.ts` with a plain `process.env` check at module load time. Mastra reads this key internally when it initialises the OpenAI provider — Pythia's own code never passes it explicitly — so it lives outside `env.ts`, next to the thing that needs it.
 
 ---
 

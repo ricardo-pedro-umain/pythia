@@ -206,15 +206,9 @@ export default function AnalysisPage({
           </span>
           <Link
             href="/"
-            className="rounded-md border border-border px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors shrink-0"
-          >
-            New Search
-          </Link>
-          <Link
-            href="/"
             className="rounded-md bg-accent/10 border border-accent/20 px-2.5 py-1 text-xs text-accent hover:bg-accent/20 transition-colors shrink-0"
           >
-            All Companies
+            New Search
           </Link>
         </div>
         <div className="flex items-center gap-2 shrink-0">

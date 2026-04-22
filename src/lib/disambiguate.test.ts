@@ -84,6 +84,11 @@ describe("domainMatchesTerm", () => {
     expect(domainMatchesTerm("ebsco.com", "salt")).toBe(false);
   });
 
+  it("matches when the term is embedded in the domain base (getsalt → salt)", () => {
+    expect(domainMatchesTerm("getsalt.io", "salt")).toBe(true);
+    expect(domainMatchesTerm("trysalt.com", "salt")).toBe(true);
+  });
+
   it("rejects empty inputs", () => {
     expect(domainMatchesTerm("", "tesla")).toBe(false);
     expect(domainMatchesTerm("tesla.com", "")).toBe(false);
@@ -179,7 +184,9 @@ describe("disambiguateCompany", () => {
   });
 
   it("returns [] when the top candidate clearly dominates (Tesla case)", async () => {
-    // tesla.com at 0.95, nothing close. Should skip disambiguation.
+    // tesla.com at 0.95 — wikipedia is in GENERIC_DOMAINS so it's filtered
+    // before ranking, leaving only one candidate → ranked.length <= 1 → [].
+    // This path doesn't even reach the ratio check.
     searchMock
       .mockResolvedValueOnce(
         tavilyResponse([
@@ -207,6 +214,30 @@ describe("disambiguateCompany", () => {
           },
         ])
       );
+
+    const out = await disambiguateCompany("Tesla");
+    expect(out).toEqual([]);
+  });
+
+  it("returns [] via ratio check when one domain is overwhelmingly dominant (≥0.85 and ≥2× runner-up)", async () => {
+    // Simulates a company where two domain variants exist (tesla.com + tesla.io)
+    // but one is so dominant the ratio gate fires.
+    searchMock.mockResolvedValue(
+      tavilyResponse([
+        {
+          url: "https://www.tesla.com/",
+          title: "Tesla | Electric Cars",
+          content: "Tesla is the electric car company.",
+          score: 0.95,
+        },
+        {
+          url: "https://tesla.io/",
+          title: "Tesla IO",
+          content: "tesla is a small dev tool.",
+          score: 0.44, // 0.95 >= 0.85 ✓ and 0.95 >= 0.44 * 2.0 = 0.88 ✓
+        },
+      ])
+    );
 
     const out = await disambiguateCompany("Tesla");
     expect(out).toEqual([]);
