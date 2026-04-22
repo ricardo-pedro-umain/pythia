@@ -10,7 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "evals": "tsx --tsconfig evals/tsconfig.json evals/run-evals.ts"
+    "evals": "node --env-file=.env.local --import tsx evals/run-evals.ts"
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.53",
